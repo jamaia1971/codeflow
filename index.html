@@ -22,6 +22,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/acorn/8.11.3/acorn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/web-tree-sitter@0.25.10/tree-sitter.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jsrsasign/11.1.0/jsrsasign-all-min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
     <style>
@@ -433,6 +434,33 @@ const LAYER_COLORS={ui:'#4d9fff',components:'#22d3ee',services:'#a78bfa',utils:'
 const IGNORE=new Set(['node_modules','.git','vendor','dist','build','__pycache__','.next','coverage','.venv','venv','env','.env','.tox','.mypy_cache','.pytest_cache','.ruff_cache','__pypackages__','.eggs']);
 
 const Parser={
+    // tree-sitter Python parser (real AST parser, loaded async via WASM)
+    _tsParser:null,
+    _tsInitPromise:null,
+    initTreeSitter:async function(){
+        if(this._tsParser)return this._tsParser;
+        if(this._tsInitPromise)return this._tsInitPromise;
+        this._tsInitPromise=(async()=>{
+            if(typeof TreeSitter==='undefined')return null;
+            try{
+                await TreeSitter.init({
+                    locateFile:function(scriptName){
+                        return 'https://cdn.jsdelivr.net/npm/web-tree-sitter@0.25.10/'+scriptName;
+                    }
+                });
+                var parser=new TreeSitter();
+                var Python=await TreeSitter.Language.load(
+                    'https://cdn.jsdelivr.net/npm/tree-sitter-wasms@0.1.13/out/tree-sitter-python.wasm'
+                );
+                parser.setLanguage(Python);
+                this._tsParser=parser;
+                return parser;
+            }catch(e){
+                return null;
+            }
+        })();
+        return this._tsInitPromise;
+    },
     codeExts:['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.pyw','.pyi','.java','.go','.rb','.php','.vue','.svelte','.rs','.c','.cpp','.cc','.h','.hpp','.cs','.swift','.kt','.kts','.scala','.clj','.ex','.exs','.erl','.hs','.lua','.r','.R','.jl','.dart','.elm','.fs','.fsx','.ml','.pl','.pm','.sh','.bash','.zsh','.fish','.ps1','.psm1','.groovy','.gradle','.vba','.bas','.cls','.xlsm','.xlam','.xlsb','.xla','.xlw'],
     textExts:['.md','.txt','.json','.yaml','.yml','.toml','.xml','.html','.htm','.css','.scss','.sass','.less','.svg','.graphql','.gql','.sql','.prisma','.proto','.tf','.tfvars','.dockerfile','.env','.env.example','.gitignore','.eslintrc','.prettierrc','.babelrc','.editorconfig','.ini','.cfg','.conf','.properties','.lock','.csv','.rst','.tex','.makefile','.cmake','.rake','.vba','.bas','.cls','.xlsm','.xlam','.xlsb','.xla','.xlw'],
     binExts:['.png','.jpg','.jpeg','.gif','.ico','.webp','.bmp','.svg','.woff','.woff2','.ttf','.eot','.otf','.pdf','.zip','.tar','.gz','.rar','.7z','.exe','.dll','.so','.dylib','.bin','.dat','.db','.sqlite','.mp3','.mp4','.wav','.avi','.mov','.webm'],
@@ -975,17 +1003,36 @@ const Parser={
             lines=scriptContent.split('\n');
         }
 
-        // Try AST parsing for JS/TS files
+        // Try AST parsing for JS/TS files using real parsers
         if((isJS||isTS)&&typeof acorn!=='undefined'){
             var parseContent=scriptContent;
             var parseSuccess=false;
 
-            // For TypeScript, strip types first
-            if(isTS){
+            // Use Babel (real parser) to handle JSX and TypeScript properly
+            // Babel transforms JSX → React.createElement and strips TS types,
+            // producing clean JS that acorn can parse into a proper AST
+            if(typeof Babel!=='undefined'){
+                try{
+                    var babelPresets=['react'];
+                    if(isTS)babelPresets.push('typescript');
+                    var babelResult=Babel.transform(parseContent,{
+                        presets:babelPresets,
+                        filename:filename||'file.js',
+                        sourceType:'module',
+                        retainLines:true
+                    });
+                    parseContent=babelResult.code;
+                }catch(babelErr){
+                    // Babel failed, fall back to manual TypeScript stripping
+                    if(isTS){
+                        parseContent=Parser.stripTypeScript(scriptContent);
+                    }
+                }
+            }else if(isTS){
                 parseContent=Parser.stripTypeScript(scriptContent);
             }
 
-            // Try parsing
+            // Parse clean JS with acorn
             try{
                 var ast=acorn.parse(parseContent,{
                     ecmaVersion:2022,
@@ -1258,6 +1305,67 @@ const Parser={
         return fns;
     },
 
+    // Strip Python string literals and comments for accurate token-level analysis
+    // This is a proper tokenizer approach: preserves code structure while removing non-code content
+    stripPythonNonCode:function(content){
+        var result=[];
+        var i=0;
+        var len=content.length;
+        while(i<len){
+            // Triple-quoted strings (must check before single quotes)
+            if(i<len-2&&((content[i]==='"'&&content[i+1]==='"'&&content[i+2]==='"')||(content[i]==="'"&&content[i+1]==="'"&&content[i+2]==="'"))){
+                var q3=content[i];
+                i+=3;
+                while(i<len-2){
+                    if(content[i]===q3&&content[i+1]===q3&&content[i+2]===q3){i+=3;break;}
+                    result.push(content[i]==='\n'?'\n':' ');
+                    i++;
+                }
+            }
+            // String prefixes (f/r/b/u and combinations like rb, fr, etc.)
+            else if(i<len-1&&/^[frbuFRBU]{1,2}$/.test(content.slice(i,i+1+(content[i+1]&&/[frbuFRBU"']/.test(content[i+1])?1:0)).replace(/["']/g,''))&&
+                    (content[i+1]==='"'||content[i+1]==="'"||content[i+2]==='"'||content[i+2]==="'")){
+                // Skip prefix chars
+                while(i<len&&content[i]!=='"'&&content[i]!=="'"){result.push(' ');i++;}
+                // Fall through to string handling below (don't continue)
+                if(i>=len)break;
+                // Check for triple-quoted prefixed string
+                if(i<len-2&&content[i+1]===content[i]&&content[i+2]===content[i]){
+                    var pq3=content[i];i+=3;
+                    while(i<len-2){
+                        if(content[i]===pq3&&content[i+1]===pq3&&content[i+2]===pq3){i+=3;break;}
+                        result.push(content[i]==='\n'?'\n':' ');i++;
+                    }
+                }else{
+                    var pq=content[i];result.push(' ');i++;
+                    while(i<len&&content[i]!==pq&&content[i]!=='\n'){
+                        if(content[i]==='\\'){result.push(' ');i++;}
+                        if(i<len){result.push(content[i]==='\n'?'\n':' ');i++;}
+                    }
+                    if(i<len&&content[i]===pq){result.push(' ');i++;}
+                }
+            }
+            // Regular single/double quoted strings
+            else if(content[i]==='"'||content[i]==="'"){
+                var q=content[i];result.push(' ');i++;
+                while(i<len&&content[i]!==q&&content[i]!=='\n'){
+                    if(content[i]==='\\'){result.push(' ');i++;}
+                    if(i<len){result.push(content[i]==='\n'?'\n':' ');i++;}
+                }
+                if(i<len&&content[i]===q){result.push(' ');i++;}
+            }
+            // Comments
+            else if(content[i]==='#'){
+                while(i<len&&content[i]!=='\n'){result.push(' ');i++;}
+            }
+            // Normal code - pass through
+            else{
+                result.push(content[i]);i++;
+            }
+        }
+        return result.join('');
+    },
+
     // Strip TypeScript syntax for Acorn parsing
     stripTypeScript:function(content){
         // Process line by line for more control
@@ -1326,22 +1434,22 @@ const Parser={
             var lineNum=idx+1+offset;
             var m;
 
-            // Named function declarations
-            if((m=line.match(/(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/)))
-                addFn({name:m[1],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,type:'function'});
+            // Named function declarations (capture export keyword for isExported)
+            if((m=line.match(/(export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/)))
+                addFn({name:m[2],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,isExported:!!m[1],type:'function'});
 
             // Arrow functions assigned to const/let/var at START of meaningful content
             // Must have = directly followed by arrow function pattern
-            if((m=line.match(/(?:export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/)))
-                addFn({name:m[1],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,type:'arrow'});
+            if((m=line.match(/(export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/)))
+                addFn({name:m[2],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,isExported:!!m[1],type:'arrow'});
 
             // Arrow functions with single param (no parens): const foo = x =>
-            if((m=line.match(/(?:export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>/)))
-                addFn({name:m[1],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,type:'arrow'});
+            if((m=line.match(/(export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>/)))
+                addFn({name:m[2],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,isExported:!!m[1],type:'arrow'});
 
             // Function expressions: const foo = function
-            if((m=line.match(/(?:export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?function\s*[(\w]/)))
-                addFn({name:m[1],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,type:'function'});
+            if((m=line.match(/(export\s+)?(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?function\s*[(\w]/)))
+                addFn({name:m[2],file:filename,line:lineNum,code:extractCode(lineNum),isTopLevel:true,isExported:!!m[1],type:'function'});
 
             // Class methods (inside class body): methodName() { or async methodName() {
             if((m=line.match(/^\s+(?:async\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\([^)]*\)\s*\{/))&&!line.match(/^s*(if|for|while|switch|catch|function|const|let|var)/))
@@ -1438,47 +1546,88 @@ const Parser={
         var isJS=['js','jsx','ts','tsx','mjs','cjs','vue','svelte'].indexOf(ext)>=0;
         var isVBA=['vba','bas','cls','xlsm','xlam'].indexOf(ext)>=0;
 
-        // Python-specific import and call detection
+        // Python: use tree-sitter real parser (WASM) for accurate AST-based detection
         if(isPython){
-            var wordSet=new Set(content.match(/\b[a-zA-Z_]\w*\b/g)||[]);
-            // Detect Python imports including multi-line: from module import (\n  func1,\n  func2\n)
+            if(Parser._tsParser){
+                try{
+                    var tree=Parser._tsParser.parse(content);
+                    var root=tree.rootNode;
+                    var fnSet=new Set(fnNames);
+
+                    // Determine if an identifier node is a definition name (not a usage)
+                    function isPyDefName(node){
+                        var p=node.parent;
+                        if(!p)return false;
+                        // Function/class definition name: def foo / class Foo
+                        if((p.type==='function_definition'||p.type==='class_definition')&&
+                            p.childForFieldName('name')===node)return true;
+                        // Parameter names in function signatures
+                        if(p.type==='parameters'||p.type==='lambda_parameters')return true;
+                        if((p.type==='typed_parameter'||p.type==='default_parameter'||
+                            p.type==='typed_default_parameter')&&p.children[0]===node)return true;
+                        if(p.type==='list_splat_pattern'||p.type==='dictionary_splat_pattern')return true;
+                        // For loop target: for x in ...
+                        if(p.type==='for_statement'&&p.childForFieldName('left')===node)return true;
+                        // With statement target: with x as y
+                        if(p.type==='as_pattern'&&p.childForFieldName('alias')===node)return true;
+                        // Exception handler: except E as e
+                        if(p.type==='except_clause')return false; // the exception type IS a reference
+                        // Comprehension targets: [x for x in ...]
+                        if(p.type==='for_in_clause'&&p.childForFieldName('left')===node)return true;
+                        return false;
+                    }
+
+                    // Walk the CST: every identifier that matches a function name
+                    // and is NOT a definition is counted as a usage reference.
+                    // tree-sitter naturally excludes identifiers inside strings/comments
+                    // because those are parsed as string/comment nodes, not identifiers.
+                    function walkPy(node){
+                        if(node.type==='identifier'&&fnSet.has(node.text)&&!isPyDefName(node)){
+                            calls[node.text]++;
+                        }
+                        for(var i=0;i<node.childCount;i++){
+                            walkPy(node.child(i));
+                        }
+                    }
+                    walkPy(root);
+                    tree.delete();
+                    return calls;
+                }catch(tsErr){
+                    // tree-sitter parse failed, fall through to tokenizer fallback
+                }
+            }
+
+            // Fallback: token-level analysis with string/comment stripping
+            var cleanContent=Parser.stripPythonNonCode(content);
+            var wordSet=new Set(cleanContent.match(/\b[a-zA-Z_]\w*\b/g)||[]);
             var importText='';
-            var multiImports=content.match(/from\s+\S+\s+import\s*\([\s\S]*?\)/g)||[];
+            var multiImports=cleanContent.match(/from\s+\S+\s+import\s*\([\s\S]*?\)/g)||[];
             multiImports.forEach(function(imp){importText+=imp+'\n';});
-            var singleImports=content.match(/^(?:from\s+\S+\s+import\s+[^(\n].+|import\s+.+)$/gm)||[];
+            var singleImports=cleanContent.match(/^(?:from\s+\S+\s+import\s+[^(\n].+|import\s+.+)$/gm)||[];
             singleImports.forEach(function(imp){importText+=imp+'\n';});
             fnNames.forEach(function(fn){
                 if(!wordSet.has(fn))return;
-                if(importText.match(new RegExp('\\b'+fn+'\\b'))){
-                    calls[fn]++;
-                }
+                if(importText.match(new RegExp('\\b'+fn+'\\b'))){calls[fn]++;}
             });
-            // Detect function calls and class instantiations
             fnNames.forEach(function(fn){
                 if(!wordSet.has(fn))return;
-                // Direct calls: fn( or Class(
                 var callPattern=new RegExp('\\b'+fn+'\\s*\\(','g');
-                var m=content.match(callPattern);
+                var m=cleanContent.match(callPattern);
                 var callCount=m?m.length:0;
-                // Subtract definitions (def fn( or class Fn)
                 var defPattern=new RegExp('(?:(?:async\\s+)?def|class)\\s+'+fn+'\\s*[\\(:]','g');
-                var defMatch=content.match(defPattern);
+                var defMatch=cleanContent.match(defPattern);
                 if(defMatch)callCount-=defMatch.length;
-                // Subtract decorator usage (@fn)
                 var decPattern=new RegExp('@'+fn+'\\b','g');
-                var decMatch=content.match(decPattern);
+                var decMatch=cleanContent.match(decPattern);
                 if(decMatch)callCount=Math.max(0,callCount)+(decMatch.length);
-                // Method calls: self.fn( or cls.fn( or obj.fn(
                 var methodPattern=new RegExp('\\w+\\.'+fn+'\\s*\\(','g');
-                var methodMatch=content.match(methodPattern);
+                var methodMatch=cleanContent.match(methodPattern);
                 if(methodMatch)callCount+=methodMatch.length;
-                // References as arguments, collections, dict/set values, and callback assignments
                 var refPattern=new RegExp('[,\\[\\(=:\\{]\\s*'+fn+'\\s*[,\\]\\)\\n\\r}]','g');
-                var refMatch=content.match(refPattern);
+                var refMatch=cleanContent.match(refPattern);
                 var refCount=refMatch?refMatch.length:0;
-                // Also catch fn as standalone value at end of expression: return fn / yield fn
                 var retPattern=new RegExp('(?:return|yield)\\s+'+fn+'\\s*$','gm');
-                var retMatch=content.match(retPattern);
+                var retMatch=cleanContent.match(retPattern);
                 if(retMatch)refCount+=retMatch.length;
                 calls[fn]=Math.max(0,callCount)+refCount;
             });
@@ -1487,16 +1636,44 @@ const Parser={
 
         if(isJS&&typeof acorn!=='undefined'){
             try{
-                // Strip TypeScript types for parsing
-                var jsContent=content
-                    .replace(/:\s*[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[=,\)\}\];])/g,'')
-                    .replace(/\bas\s+[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[,\)\}\];])/g,'')
-                    .replace(/<[A-Za-z_$][\w$<>,\s|&\[\]]*>(?=\s*\()/g,'')
-                    .replace(/^import\s+type\s+.*/gm,'')
-                    .replace(/^export\s+type\s+.*/gm,'')
-                    .replace(/^export\s+interface\s+.*/gm,'')
-                    .replace(/interface\s+[A-Za-z_$][\w$]*\s*\{[^}]*\}/g,'')
-                    .replace(/type\s+[A-Za-z_$][\w$]*\s*=\s*[^;]+;/g,'');
+                // Use Babel (real parser) to handle JSX and TypeScript
+                // Babel transforms JSX → React.createElement calls and strips TS types,
+                // so acorn can parse the result into a proper AST for accurate call detection
+                var jsContent=content;
+                if(typeof Babel!=='undefined'){
+                    try{
+                        var babelPresets=['react'];
+                        if(ext==='ts'||ext==='tsx')babelPresets.push('typescript');
+                        var babelResult=Babel.transform(content,{
+                            presets:babelPresets,
+                            filename:definingFile||'file.js',
+                            sourceType:'module',
+                            retainLines:true
+                        });
+                        jsContent=babelResult.code;
+                    }catch(babelErr){
+                        // Babel failed, fall back to manual TypeScript stripping
+                        jsContent=content
+                            .replace(/:\s*[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[=,\)\}\];])/g,'')
+                            .replace(/\bas\s+[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[,\)\}\];])/g,'')
+                            .replace(/<[A-Za-z_$][\w$<>,\s|&\[\]]*>(?=\s*\()/g,'')
+                            .replace(/^import\s+type\s+.*/gm,'')
+                            .replace(/^export\s+type\s+.*/gm,'')
+                            .replace(/^export\s+interface\s+.*/gm,'')
+                            .replace(/interface\s+[A-Za-z_$][\w$]*\s*\{[^}]*\}/g,'')
+                            .replace(/type\s+[A-Za-z_$][\w$]*\s*=\s*[^;]+;/g,'');
+                    }
+                }else{
+                    jsContent=content
+                        .replace(/:\s*[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[=,\)\}\];])/g,'')
+                        .replace(/\bas\s+[A-Za-z_$][\w$<>,\s|&\[\]]*(?=\s*[,\)\}\];])/g,'')
+                        .replace(/<[A-Za-z_$][\w$<>,\s|&\[\]]*>(?=\s*\()/g,'')
+                        .replace(/^import\s+type\s+.*/gm,'')
+                        .replace(/^export\s+type\s+.*/gm,'')
+                        .replace(/^export\s+interface\s+.*/gm,'')
+                        .replace(/interface\s+[A-Za-z_$][\w$]*\s*\{[^}]*\}/g,'')
+                        .replace(/type\s+[A-Za-z_$][\w$]*\s*=\s*[^;]+;/g,'');
+                }
 
                 var ast=acorn.parse(jsContent,{
                     ecmaVersion:2022,
@@ -1591,8 +1768,14 @@ const Parser={
             var m=content.match(callPattern);
             var callCount=m?m.length:0;
 
-            // Subtract definition (function fn() or const fn = or def fn( or class fn) - these aren't calls
-            var defPattern=new RegExp('(?:function\\s+'+fn+'\\s*\\(|(?:const|let|var)\\s+'+fn+'\\s*=|(?:async\\s+)?def\\s+'+fn+'\\s*\\(|class\\s+'+fn+'\\s*[\\(:]?)','g');
+            // Subtract definitions that also match callPattern (fn() in definition context)
+            // ONLY subtract patterns where the definition itself produces a fn( match:
+            //   function fn(  →  matches callPattern, subtract
+            //   def fn(       →  matches callPattern, subtract
+            //   class fn(     →  matches callPattern, subtract
+            // DO NOT subtract const/let/var fn = because arrow functions (const fn = () =>)
+            // do NOT produce a fn( match, so subtracting would zero out real calls
+            var defPattern=new RegExp('(?:function\\s+'+fn+'\\s*\\(|(?:async\\s+)?def\\s+'+fn+'\\s*\\(|class\\s+'+fn+'\\s*\\()','g');
             var defMatch=content.match(defPattern);
             if(defMatch)callCount-=defMatch.length;
 
@@ -2283,6 +2466,8 @@ function App(){
 
             async function finishAnalysis(){
                 try{
+                // Initialize tree-sitter Python parser (async WASM load, runs in parallel)
+                Parser.initTreeSitter();
                 // Phase 1: Build function stats index
                 setProgress('Building dependency graph (1/5)...');
                 await new Promise(function(r){setTimeout(r,0);});
@@ -2310,6 +2495,8 @@ function App(){
                     }
                 });
 
+                // Wait for tree-sitter to finish loading (started in parallel during Phase 1)
+                await Parser.initTreeSitter();
                 // Phase 2: Find calls in batches with yielding to prevent UI freeze
                 var CALL_BATCH=30;
                 for(var bi=0;bi<analyzed.length;bi+=CALL_BATCH){
@@ -2366,12 +2553,10 @@ function App(){
                     if((baseName==='upgrade'||baseName==='downgrade')&&stats.file&&(stats.file.includes('migration')||stats.file.includes('alembic')||stats.file.includes('versions')))return false;
                     // Python-aware: skip common framework entry points and hooks
                     if(['main','create_app','make_app','get_app','setup','configure','register','on_startup','on_shutdown','lifespan'].indexOf(baseName)>=0)return false;
-                    // React/JSX: skip exported PascalCase components in .jsx/.tsx files
-                    // These are React components imported and used as <Component /> in other files
-                    if(stats.isExported&&stats.file&&/\.[jt]sx$/.test(stats.file)&&/^[A-Z]/.test(baseName))return false;
-                    // React/JSX: skip functions in .jsx/.tsx files that follow handler/callback conventions
-                    // These are typically used in JSX attributes: onClick={handleSubmit}
-                    if(stats.file&&/\.[jt]sx$/.test(stats.file)&&/^(?:handle|on)[A-Z]/.test(baseName))return false;
+                    // JS/TS: skip explicitly exported functions (module exports are meant for external consumption)
+                    // The export keyword is an explicit declaration of public API - if call detection
+                    // can't find usage, it's a detection gap, not genuinely dead code
+                    if(stats.isExported&&stats.file&&/\.[jt]sx?$/.test(stats.file))return false;
                     // Skip functions in test/spec files (broader pattern)
                     if(stats.file&&(/\.(?:spec|test)\.[jt]sx?$/.test(stats.file)||stats.file.includes('__tests__')))return false;
                     // This is a top-level function with zero calls and no framework registration
@@ -2553,6 +2738,8 @@ function App(){
 
         async function finishAnalysis(){
             try{
+            // Initialize tree-sitter Python parser (async WASM load, runs in parallel)
+            Parser.initTreeSitter();
             // Phase 1: Build function stats index
             setProgress('Building dependency graph (1/5)...');
             await new Promise(function(r){setTimeout(r,0);});
@@ -2579,6 +2766,8 @@ function App(){
                 }
             });
 
+            // Wait for tree-sitter to finish loading (started in parallel during Phase 1)
+            await Parser.initTreeSitter();
             // Phase 2: Find calls in batches with yielding to prevent UI freeze
             var CALL_BATCH=30;
             for(var bi=0;bi<analyzed.length;bi+=CALL_BATCH){
@@ -2628,12 +2817,8 @@ function App(){
                 if((baseName==='upgrade'||baseName==='downgrade')&&stats.file&&(stats.file.includes('migration')||stats.file.includes('alembic')||stats.file.includes('versions')))return false;
                 // Python-aware: skip common framework entry points
                 if(['main','create_app','make_app','get_app','setup','configure','register','on_startup','on_shutdown','lifespan'].indexOf(baseName)>=0)return false;
-                // React/JSX: skip exported PascalCase components in .jsx/.tsx files
-                // These are React components imported and used as <Component /> in other files
-                if(stats.isExported&&stats.file&&/\.[jt]sx$/.test(stats.file)&&/^[A-Z]/.test(baseName))return false;
-                // React/JSX: skip functions in .jsx/.tsx files that follow handler/callback conventions
-                // These are typically used in JSX attributes: onClick={handleSubmit}
-                if(stats.file&&/\.[jt]sx$/.test(stats.file)&&/^(?:handle|on)[A-Z]/.test(baseName))return false;
+                // JS/TS: skip explicitly exported functions (module exports are meant for external consumption)
+                if(stats.isExported&&stats.file&&/\.[jt]sx?$/.test(stats.file))return false;
                 // Skip functions in test/spec files (broader pattern)
                 if(stats.file&&(/\.(?:spec|test)\.[jt]sx?$/.test(stats.file)||stats.file.includes('__tests__')))return false;
                 return true;
