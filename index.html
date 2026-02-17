@@ -22,6 +22,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/acorn/8.11.3/acorn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/web-tree-sitter@0.25.10/tree-sitter.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jsrsasign/11.1.0/jsrsasign-all-min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
     <style>
@@ -433,6 +434,33 @@ const LAYER_COLORS={ui:'#4d9fff',components:'#22d3ee',services:'#a78bfa',utils:'
 const IGNORE=new Set(['node_modules','.git','vendor','dist','build','__pycache__','.next','coverage','.venv','venv','env','.env','.tox','.mypy_cache','.pytest_cache','.ruff_cache','__pypackages__','.eggs']);
 
 const Parser={
+    // tree-sitter Python parser (real AST parser, loaded async via WASM)
+    _tsParser:null,
+    _tsInitPromise:null,
+    initTreeSitter:async function(){
+        if(this._tsParser)return this._tsParser;
+        if(this._tsInitPromise)return this._tsInitPromise;
+        this._tsInitPromise=(async()=>{
+            if(typeof TreeSitter==='undefined')return null;
+            try{
+                await TreeSitter.init({
+                    locateFile:function(scriptName){
+                        return 'https://cdn.jsdelivr.net/npm/web-tree-sitter@0.25.10/'+scriptName;
+                    }
+                });
+                var parser=new TreeSitter();
+                var Python=await TreeSitter.Language.load(
+                    'https://cdn.jsdelivr.net/npm/tree-sitter-wasms@0.1.13/out/tree-sitter-python.wasm'
+                );
+                parser.setLanguage(Python);
+                this._tsParser=parser;
+                return parser;
+            }catch(e){
+                return null;
+            }
+        })();
+        return this._tsInitPromise;
+    },
     codeExts:['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.pyw','.pyi','.java','.go','.rb','.php','.vue','.svelte','.rs','.c','.cpp','.cc','.h','.hpp','.cs','.swift','.kt','.kts','.scala','.clj','.ex','.exs','.erl','.hs','.lua','.r','.R','.jl','.dart','.elm','.fs','.fsx','.ml','.pl','.pm','.sh','.bash','.zsh','.fish','.ps1','.psm1','.groovy','.gradle','.vba','.bas','.cls','.xlsm','.xlam','.xlsb','.xla','.xlw'],
     textExts:['.md','.txt','.json','.yaml','.yml','.toml','.xml','.html','.htm','.css','.scss','.sass','.less','.svg','.graphql','.gql','.sql','.prisma','.proto','.tf','.tfvars','.dockerfile','.env','.env.example','.gitignore','.eslintrc','.prettierrc','.babelrc','.editorconfig','.ini','.cfg','.conf','.properties','.lock','.csv','.rst','.tex','.makefile','.cmake','.rake','.vba','.bas','.cls','.xlsm','.xlam','.xlsb','.xla','.xlw'],
     binExts:['.png','.jpg','.jpeg','.gif','.ico','.webp','.bmp','.svg','.woff','.woff2','.ttf','.eot','.otf','.pdf','.zip','.tar','.gz','.rar','.7z','.exe','.dll','.so','.dylib','.bin','.dat','.db','.sqlite','.mp3','.mp4','.wav','.avi','.mov','.webm'],
@@ -1518,12 +1546,60 @@ const Parser={
         var isJS=['js','jsx','ts','tsx','mjs','cjs','vue','svelte'].indexOf(ext)>=0;
         var isVBA=['vba','bas','cls','xlsm','xlam'].indexOf(ext)>=0;
 
-        // Python-specific: token-level analysis with proper string/comment stripping
+        // Python: use tree-sitter real parser (WASM) for accurate AST-based detection
         if(isPython){
-            // Strip string literals and comments to avoid false matches in non-code content
+            if(Parser._tsParser){
+                try{
+                    var tree=Parser._tsParser.parse(content);
+                    var root=tree.rootNode;
+                    var fnSet=new Set(fnNames);
+
+                    // Determine if an identifier node is a definition name (not a usage)
+                    function isPyDefName(node){
+                        var p=node.parent;
+                        if(!p)return false;
+                        // Function/class definition name: def foo / class Foo
+                        if((p.type==='function_definition'||p.type==='class_definition')&&
+                            p.childForFieldName('name')===node)return true;
+                        // Parameter names in function signatures
+                        if(p.type==='parameters'||p.type==='lambda_parameters')return true;
+                        if((p.type==='typed_parameter'||p.type==='default_parameter'||
+                            p.type==='typed_default_parameter')&&p.children[0]===node)return true;
+                        if(p.type==='list_splat_pattern'||p.type==='dictionary_splat_pattern')return true;
+                        // For loop target: for x in ...
+                        if(p.type==='for_statement'&&p.childForFieldName('left')===node)return true;
+                        // With statement target: with x as y
+                        if(p.type==='as_pattern'&&p.childForFieldName('alias')===node)return true;
+                        // Exception handler: except E as e
+                        if(p.type==='except_clause')return false; // the exception type IS a reference
+                        // Comprehension targets: [x for x in ...]
+                        if(p.type==='for_in_clause'&&p.childForFieldName('left')===node)return true;
+                        return false;
+                    }
+
+                    // Walk the CST: every identifier that matches a function name
+                    // and is NOT a definition is counted as a usage reference.
+                    // tree-sitter naturally excludes identifiers inside strings/comments
+                    // because those are parsed as string/comment nodes, not identifiers.
+                    function walkPy(node){
+                        if(node.type==='identifier'&&fnSet.has(node.text)&&!isPyDefName(node)){
+                            calls[node.text]++;
+                        }
+                        for(var i=0;i<node.childCount;i++){
+                            walkPy(node.child(i));
+                        }
+                    }
+                    walkPy(root);
+                    tree.delete();
+                    return calls;
+                }catch(tsErr){
+                    // tree-sitter parse failed, fall through to tokenizer fallback
+                }
+            }
+
+            // Fallback: token-level analysis with string/comment stripping
             var cleanContent=Parser.stripPythonNonCode(content);
             var wordSet=new Set(cleanContent.match(/\b[a-zA-Z_]\w*\b/g)||[]);
-            // Detect Python imports including multi-line: from module import (\n  func1,\n  func2\n)
             var importText='';
             var multiImports=cleanContent.match(/from\s+\S+\s+import\s*\([\s\S]*?\)/g)||[];
             multiImports.forEach(function(imp){importText+=imp+'\n';});
@@ -1531,34 +1607,25 @@ const Parser={
             singleImports.forEach(function(imp){importText+=imp+'\n';});
             fnNames.forEach(function(fn){
                 if(!wordSet.has(fn))return;
-                if(importText.match(new RegExp('\\b'+fn+'\\b'))){
-                    calls[fn]++;
-                }
+                if(importText.match(new RegExp('\\b'+fn+'\\b'))){calls[fn]++;}
             });
-            // Detect function calls, references, and class instantiations on cleaned content
             fnNames.forEach(function(fn){
                 if(!wordSet.has(fn))return;
-                // Direct calls: fn( or Class(
                 var callPattern=new RegExp('\\b'+fn+'\\s*\\(','g');
                 var m=cleanContent.match(callPattern);
                 var callCount=m?m.length:0;
-                // Subtract definitions (def fn( or class Fn) - these match callPattern but aren't calls
                 var defPattern=new RegExp('(?:(?:async\\s+)?def|class)\\s+'+fn+'\\s*[\\(:]','g');
                 var defMatch=cleanContent.match(defPattern);
                 if(defMatch)callCount-=defMatch.length;
-                // Decorator usage (@fn) IS a real reference - framework registration
                 var decPattern=new RegExp('@'+fn+'\\b','g');
                 var decMatch=cleanContent.match(decPattern);
                 if(decMatch)callCount=Math.max(0,callCount)+(decMatch.length);
-                // Method calls: self.fn( or cls.fn( or obj.fn(
                 var methodPattern=new RegExp('\\w+\\.'+fn+'\\s*\\(','g');
                 var methodMatch=cleanContent.match(methodPattern);
                 if(methodMatch)callCount+=methodMatch.length;
-                // References: passed as arguments, in collections, dict/set values, assignments
                 var refPattern=new RegExp('[,\\[\\(=:\\{]\\s*'+fn+'\\s*[,\\]\\)\\n\\r}]','g');
                 var refMatch=cleanContent.match(refPattern);
                 var refCount=refMatch?refMatch.length:0;
-                // Return/yield references: return fn / yield fn
                 var retPattern=new RegExp('(?:return|yield)\\s+'+fn+'\\s*$','gm');
                 var retMatch=cleanContent.match(retPattern);
                 if(retMatch)refCount+=retMatch.length;
@@ -2399,6 +2466,8 @@ function App(){
 
             async function finishAnalysis(){
                 try{
+                // Initialize tree-sitter Python parser (async WASM load, runs in parallel)
+                Parser.initTreeSitter();
                 // Phase 1: Build function stats index
                 setProgress('Building dependency graph (1/5)...');
                 await new Promise(function(r){setTimeout(r,0);});
@@ -2426,6 +2495,8 @@ function App(){
                     }
                 });
 
+                // Wait for tree-sitter to finish loading (started in parallel during Phase 1)
+                await Parser.initTreeSitter();
                 // Phase 2: Find calls in batches with yielding to prevent UI freeze
                 var CALL_BATCH=30;
                 for(var bi=0;bi<analyzed.length;bi+=CALL_BATCH){
@@ -2667,6 +2738,8 @@ function App(){
 
         async function finishAnalysis(){
             try{
+            // Initialize tree-sitter Python parser (async WASM load, runs in parallel)
+            Parser.initTreeSitter();
             // Phase 1: Build function stats index
             setProgress('Building dependency graph (1/5)...');
             await new Promise(function(r){setTimeout(r,0);});
@@ -2693,6 +2766,8 @@ function App(){
                 }
             });
 
+            // Wait for tree-sitter to finish loading (started in parallel during Phase 1)
+            await Parser.initTreeSitter();
             // Phase 2: Find calls in batches with yielding to prevent UI freeze
             var CALL_BATCH=30;
             for(var bi=0;bi<analyzed.length;bi+=CALL_BATCH){
